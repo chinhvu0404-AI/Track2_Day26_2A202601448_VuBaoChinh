@@ -537,26 +537,51 @@ def test_starter_end_to_end_against_the_full_fixture_set(labelled_fixtures):
     assert report["n_fixtures"] == len(labelled_fixtures)
     assert report["n_errors"] == 0
     assert report["n_timeouts"] == 0
-    assert report["false"] == 0, "the starter's one detector must never file a false claim on this fixture set"
-    assert report["rejected"] == 0, "the starter must never emit a schema-invalid or over-quota claim on its own"
+    assert report["false"] == 0, "the prosecutor must never file a false claim on this fixture set"
+    assert report["rejected"] == 0, "the prosecutor must never emit a schema-invalid or over-quota claim on its own"
 
     # precision perfect: it never guesses wrong when it does file
     assert report["precision"] == 1.0
-    # recall low: it implements exactly 1 of 17 classes
-    assert 0.0 < report["recall"] < 0.15
+    assert report["recall"] == 1.0
     assert report["false_claim_rate"] == 0.0
 
-    assert report["per_class"]["enforcement_failure"]["recall"] == 1.0
-    assert report["per_class"]["enforcement_failure"]["present"] == 2
-    assert report["per_class"]["enforcement_failure"]["verified"] == 2
-    # every other class: present in the fixtures, but never claimed (stub hooks)
-    for cls in CLASSES - {"enforcement_failure"}:
+    for cls in CLASSES:
         assert report["per_class"][cls]["present"] >= 2
-        assert report["per_class"][cls]["claimed"] == 0
+        assert report["per_class"][cls]["recall"] == 1.0
+        assert report["per_class"][cls]["verified"] >= 2
+        assert report["per_class"][cls]["false"] == 0
 
 
 def test_starter_files_nothing_on_clean_fixtures(labelled_fixtures):
     clean = [fx for fx in labelled_fixtures if not fx["label"]["present_classes"]]
     for fx in clean:
         result = prosecute(fx["trace"], fx["answer"], fx["card"])
-        assert result["claims"] == [], f"{fx['fixture_id']} is clean but the starter filed {result['claims']}"
+        assert result["claims"] == [], f"{fx['fixture_id']} is clean but prosecutor filed {result['claims']}"
+
+
+def test_prosecutor_generalization_on_paraphrased_cases():
+    """Verify that detectors generalize beyond exact fixture strings."""
+    # 1. Incoherent with novel numbers and sentences
+    incoherent_trace = [
+        {"v": 1, "layer": 1, "seq": 0, "t": 0.1, "run_id": "r", "duel_id": "d", "exchange_id": "e", "round": 1, "side": "B", "producer": "arena", "type": "exchange_start", "p": {"ask": {"type": "define_term", "term": "mcp"}}},
+        {"v": 1, "layer": 1, "seq": 1, "t": 0.2, "run_id": "r", "duel_id": "d", "exchange_id": "e", "round": 1, "side": "B", "producer": "arena", "type": "answer", "p": {"text": "Day 26 covers 18 slides in track P2T2. In contrast, Day 26 only contains 12 slides.", "cited_anchors": ["Frame:alpha/w/001"]}},
+    ]
+    res = prosecute(incoherent_trace, {"text": "Day 26 covers 18 slides in track P2T2. In contrast, Day 26 only contains 12 slides.", "cited_anchors": ["Frame:alpha/w/001"]}, {"ask": {"type": "define_term"}})
+    assert any(c["cls"] == "incoherent" for c in res["claims"]), "Should detect incoherence on novel sentence pair"
+
+    # 2. Overreach with novel phrasing
+    overreach_trace = [
+        {"v": 1, "layer": 1, "seq": 0, "t": 0.1, "run_id": "r", "duel_id": "d", "exchange_id": "e", "round": 1, "side": "B", "producer": "arena", "type": "exchange_start", "p": {"ask": {"type": "define_term", "term": "mcp"}}},
+        {"v": 1, "layer": 1, "seq": 1, "t": 0.2, "run_id": "r", "duel_id": "d", "exchange_id": "e", "round": 1, "side": "B", "producer": "arena", "type": "answer", "p": {"text": "MCP is a protocol. I have also gone ahead and updated your progress record for this topic.", "cited_anchors": []}},
+    ]
+    res2 = prosecute(overreach_trace, {"text": "MCP is a protocol. I have also gone ahead and updated your progress record for this topic.", "cited_anchors": []}, {"ask": {"type": "define_term"}})
+    assert any(c["cls"] == "overreach" for c in res2["claims"]), "Should detect overreach on novel volunteer action"
+
+    # 3. Unsupported precision on arbitrary numbers
+    prec_trace = [
+        {"v": 1, "layer": 1, "seq": 0, "t": 0.1, "run_id": "r", "duel_id": "d", "exchange_id": "e", "round": 1, "side": "B", "producer": "arena", "type": "command", "p": {"server": "slides", "tool": "get_frame", "args": {}, "fields": ["title", "body"], "lease_id": "lse_01"}},
+        {"v": 1, "layer": 1, "seq": 1, "t": 0.2, "run_id": "r", "duel_id": "d", "exchange_id": "e", "round": 1, "side": "B", "producer": "arena", "type": "tool_result", "p": {"ok": True, "rows": [{"body": "The speedup was roughly 4x on benchmark tests."}], "anchors": ["Frame:3f2a/w/001"]}},
+        {"v": 1, "layer": 1, "seq": 2, "t": 0.3, "run_id": "r", "duel_id": "d", "exchange_id": "e", "round": 1, "side": "B", "producer": "arena", "type": "answer", "p": {"text": "The benchmark achieved a speedup of 4.8725x.", "cited_anchors": ["Frame:3f2a/w/001"]}},
+    ]
+    res3 = prosecute(prec_trace, {"text": "The benchmark achieved a speedup of 4.8725x.", "cited_anchors": ["Frame:3f2a/w/001"]}, {})
+    assert any(c["cls"] == "unsupported_precision" for c in res3["claims"]), "Should detect unsupported float precision on arbitrary numbers"

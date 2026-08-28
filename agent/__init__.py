@@ -6,9 +6,9 @@ classes (CONTRACTS.md section 6.1) each one can save you from.
     gateway.py      the control plane: Gateway.decide(cmd) -> Decision
                      (CONTRACTS.md section 4, exactly)
     strategy.py      discovery / delegation / caching / replica / budget
-                     policy — building blocks, not wired in by default
-    guardrails.py    grounding (real), injection/redaction/arithmetic
-                     (named stubs), abstention (real, naive)
+                     policy — selected pieces are enforced by the gateway
+    guardrails.py    grounding, injection refusal, redaction, arithmetic,
+                     and a fail-closed answer assembly pipeline
     telemetry.py     ctx.emit wrappers — your own side only, never scored
     prompt.md        the system prompt LAYERED ON TOP of kit.loop.prompt's
                      harness prompt (not a replacement for it)
@@ -27,6 +27,13 @@ rule 2) — these four imports are expected to always succeed together:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from agent.gateway import Command, Decision, Gateway, GatewayContext
 from agent.guardrails import (
     ArithmeticCheckResult,
@@ -34,6 +41,7 @@ from agent.guardrails import (
     InjectionScanResult,
     RedactionResult,
     abstention_policy,
+    assemble_guarded_answer,
     check_grounding,
     redact,
     scan_for_injected_instructions,
@@ -69,6 +77,7 @@ __all__ = [
     "ArithmeticCheckResult",
     "verify_arithmetic",
     "abstention_policy",
+    "assemble_guarded_answer",
     # strategy.py
     "BudgetPacer",
     "ReplicaChoice",

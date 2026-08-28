@@ -58,18 +58,13 @@ credit penalty PLUS an `integrity` event that hands the prosecutor a free
 agent/README.md's own table. Getting this file to just plainly return valid
 `Decision` values, every time, is worth more than getting it clever.
 
-THE STARTER'S SHAPE (read this before you start editing `decide()`)
-----------------------------------------------------------------------------
-This starter FORWARDS ALMOST EVERYTHING AND DENIES NOTHING. That is not a
-placeholder oversight — it is the honest zero-defence baseline you are
-meant to beat: `bots/rookie` in the kit's own ladder does exactly the same
-thing, and RULES.md's own words are "if you cannot beat Rookie you have a
-bug, not a strategy." `decide()` below is structured as four named jobs —
-ROUTE, ADMIT, AUTHORIZE, BUDGET — each with a one-line TODO naming what a
-real implementation checks and why. None of the four currently rejects,
-rewrites, or reroutes anything; they are seams, not solutions. Fill them in
-using `agent/strategy.py` (routing/budget policy) and `agent/guardrails.py`
-(the safety checks) — both already import cleanly from here.
+THE IMPLEMENTED SHAPE
+---------------------
+`decide()` is structured as ROUTE, ADMIT, AUTHORIZE, and BUDGET. It rewrites
+deprecated or excessive-mask calls, validates leases, scopes, learner
+ownership, A2A peer admission, write preconditions and observed provenance,
+then enforces a conservative per-round credit ceiling. Every negative branch
+returns a valid, zero-credit denial; it never raises on an untrusted command.
 
 ONE THING WORTH INTERNALISING BEFORE YOU WRITE YOUR FIRST REAL CHECK:
 `verdict="deny"` costs the CALLER (your own team) **zero credits** —
@@ -85,8 +80,20 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from agent.strategy import (
+    BudgetPacer,
+    is_catalog_trap,
+    successor_of,
+)
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
 # degrade gracefully). It is present as of this writing and is core, stable
@@ -102,6 +109,11 @@ try:
 except ImportError:  # pragma: no cover - collaborator file
     ToolCall = Any  # type: ignore[assignment, misc]
     _TOOLCALL_AVAILABLE = False
+
+try:
+    from kit.mcp.specs import cost as _tool_cost
+except ImportError:  # pragma: no cover - collaborator file
+    _tool_cost = None
 
 # kit.loop.agent is also a collaborator's file, used only by this module's
 # own __main__ demo (to build real Commands the same way the arena's trusted
@@ -314,124 +326,242 @@ class GatewayContext(Protocol):
     def emit(self, name: str, **payload: Any) -> None: ...
 
 
+def _normalize_learner(val: str | None) -> str | None:
+    if not val:
+        return None
+    s = val.strip().lower()
+    if s.startswith("learner:"):
+        return s[len("learner:"):]
+    return s
+
+
+WRITE_TOOLS = {
+    ("progress", "record_mastery"),
+    ("content", "flag_stale_slide"),
+    ("content", "file_content_bug"),
+}
+A2A_SERVERS = {"curriculum-analyst", "citation-checker", "roster"}
+
+
 class Gateway:
     """The control plane. One instance per duel (CONTRACTS.md 4.3) — built
     once at duel start with a `GatewayContext`, then asked to `decide()` on
     every MCP/A2A/DISCOVER command either side of the duel makes for all 10
     rounds. See the module docstring for the trusted-envelope diagram and
     why there is no `execute()` to call instead.
-
-    Instance attributes below are this starter's ENTIRE per-duel memory —
-    all currently unused by `decide()`'s naive body, but declared here
-    (rather than invented ad hoc later) so the four TODO jobs below have
-    somewhere obvious to keep state once you implement them. `agent/
-    strategy.py` has working building blocks for exactly this (a budget
-    pacer, a result cache, a replica-choice heuristic) — this starter does
-    not wire them in for you; that wiring is the assignment.
     """
 
     def __init__(self, ctx: GatewayContext) -> None:
         self.ctx = ctx
         self._telemetry = Telemetry(ctx)
-
-        # --- per-duel memory, unused by the naive starter below ---------
-        # A cache of anchor -> body-ish data you have already paid for this
-        # duel (agent/strategy.py's ResultCache is a ready-made version of
-        # this). Populating it needs the *result* of a call, which decide()
-        # never sees (it only sees the outgoing Command) — you would fill
-        # this from whatever the arena hands back to your agent loop AFTER
-        # a call executes, then consult it here on the NEXT decide() call
-        # for the same anchor.
-        self._seen_anchors: dict[str, Any] = {}
-        # Credits you have personally authorised so far this duel — your
-        # own running total, independent of (and a cross-check against)
-        # `ctx.credits`, which the arena maintains authoritatively.
+        self._pacer = BudgetPacer()
+        self._etags: dict[str, str] = {}
+        self._admitted_cards: dict[str, dict] = {}
         self._credits_authorised: int = 0
-        # Command ids you have already denied, in case a later job wants to
-        # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        self._seen_idempotency_keys: set[str] = set()
+        self._drift_notes: dict[str, bool] = {}
+        self._preferred_replicas: dict[str, str] = {}
+        self._spent_by_round: dict[int, int] = {}
+        self._initial_credits: int = max(0, int(getattr(ctx, "credits", 0)))
+
+    def note_provenance(self, anchor: str, etag: str) -> None:
+        """Feed fresh etag from provenance check before writes."""
+        self._etags[anchor] = etag
+
+    def note_card(self, server: str, card: dict) -> None:
+        """Feed verified peer Agent Card from registry."""
+        self._admitted_cards[server] = card
+
+    def note_drift(self, path_id: str, drifting: bool, fresher_replica: str | None = None) -> None:
+        """Feed a drift observation and, when known, its fresher replica.
+
+        Merely knowing that two replicas differ is not enough to assume that
+        ``w`` is newer than ``c``.  Routing changes only after the caller has
+        supplied an explicit, validated winner.
+        """
+        self._drift_notes[path_id] = drifting
+        if not drifting:
+            self._preferred_replicas.pop(path_id, None)
+        elif fresher_replica in {"w", "c"}:
+            self._preferred_replicas[path_id] = fresher_replica
 
     def decide(self, cmd: Command) -> Decision:
-        """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
-        Raising anything, or returning a `Decision` `__post_init__` rejects,
-        is treated by the arena exactly like an explicit deny PLUS a 2
-        credit penalty PLUS a scored `integrity` event (CONTRACTS.md 4.1's
-        charging table) — so the one thing this method must never do is
-        blow up or wander off into I/O, no matter how tempting a "quick
-        check" against something external looks. Everything you need to
-        decide is already sitting in `cmd` and `self.ctx`.
-
-        This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
+        """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3)."""
         self._telemetry.decision_seen(cmd)
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # Refuse routes smuggled through the request body (header_spoof defense).
+        body_route = cmd.args.get("route") or cmd.args.get("_route") or cmd.args.get("replica")
+        if body_route:
+            return self.deny(cmd, reason="header_spoof: route declared in body instead of header")
+
+        routed = cmd
+        succ = successor_of(cmd.server, cmd.tool)
+        if succ is not None:
+            succ_server, succ_tool = succ
+            fields = cmd.fields
+            if (cmd.server, cmd.tool) == ("slides", "search") and (succ_server, succ_tool) == ("slides", "query"):
+                fields = tuple(f for f in cmd.fields if f in ("title", "body", "score")) or ("title",)
+            routed = replace(routed, server=succ_server, tool=succ_tool, fields=fields)
+
+        path_id = cmd.args.get("path_id")
+        preferred_replica = self._preferred_replicas.get(str(path_id)) if path_id else None
+        if preferred_replica:
+            if routed.headers.get("mcp-replica") != preferred_replica:
+                new_headers = dict(routed.headers)
+                new_headers["mcp-replica"] = preferred_replica
+                routed = replace(routed, headers=new_headers)
 
         # ------------------------------------------------------------------
-        # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        # JOB 2 — ADMIT: is this call worth letting through AT ALL?
+        # 1. Lease check on slides.get_frame
+        if routed.server == "slides" and routed.tool == "get_frame":
+            if not routed.lease_id:
+                return self.deny(cmd, reason="protocol_misuse: slides.get_frame requires a valid lease_id")
+            if not self.ctx.leases or routed.lease_id not in self.ctx.leases:
+                return self.deny(
+                    cmd,
+                    reason=f"protocol_misuse: lease_id {routed.lease_id!r} is not active in context leases {self.ctx.leases!r}"
+                )
+
+        # 2. Write headers check (If-Match & Idempotency-Key)
+        is_write_cmd = (
+            (routed.server, routed.tool) in WRITE_TOOLS
+            or bool(routed.headers.get("if-match"))
+            or bool(routed.headers.get("idempotency-key"))
+        )
+        if is_write_cmd:
+            if not routed.headers.get("if-match"):
+                return self.deny(cmd, reason="write_violation: write commands require If-Match header")
+            if not routed.headers.get("idempotency-key"):
+                return self.deny(cmd, reason="write_violation: write commands require Idempotency-Key header")
+            idem_key = str(routed.headers["idempotency-key"])
+            if idem_key in self._seen_idempotency_keys:
+                return self.deny(cmd, reason=f"write_violation: duplicate Idempotency-Key {idem_key!r} already used this duel")
 
         # ------------------------------------------------------------------
-        # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        # JOB 3 — AUTHORIZE: authority & scope
+        # 1. Scope check for writes
+        if is_write_cmd:
+            required_scope = f"wiki.write:{routed.server}"
+            scopes = frozenset(self.ctx.scopes or ())
+            if required_scope not in scopes:
+                return self.deny(
+                    cmd,
+                    reason=f"authority_exceeded: write requires scope {required_scope!r} not in ctx.scopes {sorted(scopes)!r}"
+                )
+
+        # 2. Learner identity check (act ownership)
+        for key in ("learner", "learner_id", "target", "subject", "act"):
+            target_learner = routed.args.get(key)
+            if target_learner and self.ctx.act:
+                if _normalize_learner(str(target_learner)) != _normalize_learner(self.ctx.act):
+                    return self.deny(
+                        cmd,
+                        reason=f"authority_exceeded: target {target_learner!r} != caller act {self.ctx.act!r}"
+                    )
+
+        # 3. A2A Peer & Delegation verification
+        if routed.server in A2A_SERVERS or routed.kind == "a2a":
+            if routed.server not in A2A_SERVERS:
+                return self.deny(cmd, reason=f"forged_card: unknown A2A peer {routed.server!r}")
+
+            # Audience check
+            aud = routed.headers.get("aud")
+            if not aud:
+                return self.deny(cmd, reason="identity: A2A delegation requires an aud header")
+            if aud not in (routed.server, f"mcp:{routed.server}", f"a2a:{routed.server}"):
+                return self.deny(
+                    cmd,
+                    reason=f"identity: delegation aud {aud!r} does not match target server {routed.server!r}"
+                )
+
+            # Card & Skill check
+            card = self._admitted_cards.get(routed.server)
+            if card is None:
+                return self.deny(cmd, reason=f"forged_card: no verified peer card admitted for {routed.server!r}")
+            if card.get("verified") is not True:
+                return self.deny(cmd, reason=f"forged_card: peer card for {routed.server!r} not verified")
+            raw_skills = card.get("skills")
+            if not isinstance(raw_skills, (list, tuple, set, frozenset)):
+                return self.deny(cmd, reason=f"forged_card: peer card for {routed.server!r} has no valid skills list")
+            declared_skills = {str(skill) for skill in raw_skills}
+            if routed.tool not in declared_skills:
+                return self.deny(cmd, reason=f"forged_card: skill {routed.tool!r} not declared on peer card")
+
+        # A write must be based on a provenance value observed by this
+        # gateway, not merely on an attacker-supplied If-Match string.
+        if is_write_cmd:
+            target_anchor = next(
+                (str(routed.args[key]) for key in ("anchor", "kc", "concept") if routed.args.get(key)),
+                None,
+            )
+            expected_etag = self._etags.get(target_anchor or "")
+            supplied_etag = str(routed.headers.get("if-match", ""))
+            if expected_etag is None:
+                return self.deny(cmd, reason="write_violation: no fresh provenance etag recorded for write target")
+            if supplied_etag != expected_etag:
+                return self.deny(
+                    cmd,
+                    reason=f"write_violation: If-Match does not match fresh provenance for {target_anchor!r}",
+                )
 
         # ------------------------------------------------------------------
-        # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        # JOB 4 — BUDGET: field mask and pacing
+        if is_catalog_trap(routed.server, routed.tool, routed.fields):
+            if (routed.server, routed.tool) == ("registry", "list_servers"):
+                routed = replace(routed, fields=("name",))
+            elif (routed.server, routed.tool) == ("glossary", "list_terms"):
+                routed = replace(routed, fields=("term",))
+        elif routed.fields == ("*",):
+            if (routed.server, routed.tool) == ("slides", "get_frame"):
+                routed = replace(routed, fields=("body", "title"))
+            elif (routed.server, routed.tool) == ("slides", "query"):
+                routed = replace(routed, fields=("body", "title"))
+            elif (routed.server, routed.tool) == ("registry", "list_servers"):
+                routed = replace(routed, fields=("name",))
+            elif (routed.server, routed.tool) == ("glossary", "list_terms"):
+                routed = replace(routed, fields=("term",))
 
+        # Price the least expensive possible result (one row). The trusted
+        # executor will charge the exact row count; this pre-flight ceiling
+        # prevents obviously unsustainable plans without inventing results.
+        current_round = getattr(self.ctx, "round", 1) or 1
+        try:
+            estimated_cost = (
+                _tool_cost(routed.server, routed.tool, tuple(routed.fields), n_rows=1)
+                if _tool_cost is not None
+                else 1
+            )
+        except (KeyError, TypeError, ValueError):
+            return self.deny(cmd, reason=f"protocol_misuse: unknown tool or invalid field mask {routed.server}.{routed.tool}")
+
+        spent_this_round = self._spent_by_round.get(current_round, 0)
+        if spent_this_round + estimated_cost > 11:
+            return self.deny(cmd, reason="wasteful: estimated round spend would exceed 11 credits")
+        available_credits = min(
+            max(0, int(getattr(self.ctx, "credits", 0))),
+            max(0, self._initial_credits - self._credits_authorised),
+        )
+        if estimated_cost > available_credits:
+            return self.deny(cmd, reason="wasteful: estimated call cost exceeds remaining authorised credits")
+
+        self._spent_by_round[current_round] = spent_this_round + estimated_cost
+        self._credits_authorised += estimated_cost
+        self._pacer.record_spend(current_round, estimated_cost)
+        if is_write_cmd:
+            self._seen_idempotency_keys.add(str(routed.headers["idempotency-key"]))
+
+        verdict = "rewrite" if routed != cmd else "forward"
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        decision = Decision(verdict=verdict, call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
     def deny(self, cmd: Command, reason: str) -> Decision:
-        """Not called anywhere in this starter's `decide()` — a ready-made
-        helper for when you fill in JOB 2 / JOB 3 above, so denying doesn't
-        mean hand-building a `Decision` inline at every call site. Kept as
-        a real method (not a stub) because the shape of a correct denial —
-        no `call`, a non-empty `reason` — is exactly the thing worth
-        getting right by construction rather than by convention."""
+        """Build and record a structurally valid, zero-credit denial."""
         self._denied_cmd_ids.add(cmd.cmd_id)
         decision = Decision(verdict="deny", reason=reason)
         self._telemetry.decision_made(cmd, decision)
@@ -529,7 +659,7 @@ if __name__ == "__main__":
         else:
             raise AssertionError("expected ValueError for an 'answer' action")
 
-    print("\n=== Gateway.decide — the naive starter forwards everything ===\n")
+    print("\n=== Gateway.decide — valid calls pass the defensive gateway ===\n")
     ctx = RecordingGatewayContext(
         act="learner:sv-0401",
         sub="agent:demo-team",
@@ -542,7 +672,14 @@ if __name__ == "__main__":
     )
     assert isinstance(ctx, GatewayContext), "RecordingGatewayContext must structurally satisfy GatewayContext"
     gw = Gateway(ctx)
-    for cmd in demo_commands:
+    gw.note_card(
+        "curriculum-analyst",
+        {"verified": True, "skills": ["which_days_cover"]},
+    )
+    for i, cmd in enumerate(demo_commands, start=1):
+        ctx.round = i
+        if cmd.kind == "a2a":
+            cmd = replace(cmd, headers={"aud": f"a2a:{cmd.server}"})
         decision = gw.decide(cmd)
         print(f"  decide({cmd.server}.{cmd.tool}) -> verdict={decision.verdict!r} quarantine={decision.quarantine}")
         assert decision.verdict == "forward"
@@ -552,7 +689,7 @@ if __name__ == "__main__":
         assert call_dict["tool"] == cmd.tool
         assert tuple(call_dict["fields"]) == cmd.fields
 
-    print(f"\n=== Gateway.deny — the unused-by-default free-abstention path ===\n")
+    print(f"\n=== Gateway.deny — the free-abstention path ===\n")
     denial = gw.deny(demo_commands[0], reason="demo: withholding pending a fresher registry.provenance read")
     print(f"  gw.deny(...) -> verdict={denial.verdict!r} reason={denial.reason!r} call={denial.call!r}")
     assert denial.verdict == "deny"
